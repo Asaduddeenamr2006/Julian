@@ -449,5 +449,4 @@ For issues, questions, or contributions, please open an issue on GitHub.
 
 **Built with ❤️ using only the Python Standard Library**
 
-*Julian v4.0.0 - Secure, Professional, Zero-Dependency File Transfer*
-```
+Julian v4.0.0 - Secure, Professional, Zero-Dependency File Transfer
