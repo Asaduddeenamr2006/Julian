@@ -21,7 +21,7 @@ Get Julian up and running in less than a minute. No installations or dependencie
 
 ```bash
 # Clone the repository (or download the files)
-git clone https://github.com/YOUR_USERNAME/julian.git
+git clone https://github.com/Asaduddeenamr2006/Julian
 cd julian
 
 # Run the server
