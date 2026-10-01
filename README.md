@@ -453,5 +453,3 @@ For issues, questions, or contributions, please open an issue on GitHub.
 
 *Julian v4.0.0 - Secure, Professional, Zero-Dependency File Transfer*
 ```
-
----
