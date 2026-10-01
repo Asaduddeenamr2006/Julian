@@ -1,9 +1,17 @@
 """
-Julian Server - Secure File Transfer System v3.0.0
+Julian Server - Secure File Transfer System v4.0.0
 ==================================================
 
 A production-ready, security-hardened file transfer server with advanced
 connection management, transaction tracking, and heartbeat monitoring.
+
+New in v4.0.0:
+--------------
+- Resume Transfers (continue interrupted uploads/downloads)
+- File Management (delete, rename, search with wildcards)
+- Server Fingerprint (Safety Numbers for spoofing protection)
+- Admin Code Generation (generate login codes for registered users)
+- Enhanced security with all previous features
 
 Architecture Overview:
 ----------------------
@@ -17,7 +25,7 @@ Architecture Overview:
 
 Security Features:
 ------------------
-- TLS 1.3 encryption with certificate pinning support
+- TLS 1.3 encryption
 - JSON-based protocol (prevents command injection)
 - Rate limiting (prevents brute force attacks)
 - Stealth mode (silent drop for unauthorized attempts)
@@ -25,18 +33,20 @@ Security Features:
 - MAC-based device banning
 - Pairing authentication with physical verification
 - Strong device fingerprinting (UUID + Machine ID)
+- Safety Numbers for server identity verification
+- Admin code generation for returning users
 
 Design Patterns Applied:
 ------------------------
 - Singleton: DatabaseManager (single connection instance)
 - Observer: EventBus (event-driven logging)
-- Command: UploadCommand, DownloadCommand, etc.
+- Command: UploadCommand, DownloadCommand, DeleteCommand, etc.
 - Factory: CommandFactory (command instantiation)
 - Strategy: Connection states (authenticating, idle, transferring)
 
 Author: Julian Project
 License: MIT
-Version: 3.0.0
+Version: 4.0.0
 """
 
 import socket
@@ -54,6 +64,7 @@ import re
 import uuid
 import json
 import ipaddress
+import fnmatch
 from dataclasses import dataclass, field
 from typing import Dict, List, Callable, Optional, Any
 from abc import ABC, abstractmethod
@@ -151,12 +162,6 @@ class EventBus:
     Thread Safety:
     --------------
     Uses threading.Lock to protect subscriber list from race conditions.
-    
-    Example:
-    --------
-    event_bus = EventBus()
-    event_bus.subscribe('user_connected', lambda data: log(data))
-    event_bus.publish('user_connected', {'username': 'alice'})
     """
     
     def __init__(self):
@@ -165,26 +170,14 @@ class EventBus:
         self._lock = threading.Lock()
     
     def subscribe(self, event_type: str, callback: Callable) -> None:
-        """
-        Subscribe a callback function to a specific event type.
-        
-        Args:
-            event_type: String identifier for the event (e.g., 'user_connected')
-            callback: Function to call when event is published
-        """
+        """Subscribe a callback function to a specific event type."""
         with self._lock:
             if event_type not in self._subscribers:
                 self._subscribers[event_type] = []
             self._subscribers[event_type].append(callback)
     
     def publish(self, event_type: str, data: dict = None) -> None:
-        """
-        Publish an event to all subscribers.
-        
-        Args:
-            event_type: String identifier for the event
-            data: Dictionary containing event data
-        """
+        """Publish an event to all subscribers."""
         # Copy subscriber list to avoid holding lock during callbacks
         with self._lock:
             subscribers = self._subscribers.get(event_type, []).copy()
@@ -194,7 +187,6 @@ class EventBus:
             try:
                 callback(data or {})
             except Exception as e:
-                # Log error but don't crash the server
                 logging.error(f"Event handler error for {event_type}: {e}")
 
 
@@ -210,31 +202,13 @@ class DatabaseManager:
     --------
     Ensures only ONE database connection exists across all threads.
     Prevents connection leaks and ensures thread-safe operations.
-    
-    Thread Safety:
-    --------------
-    - Uses threading.Lock for all database operations
-    - SQLite connection created with check_same_thread=False
-    - All queries wrapped in lock context
-    
-    Why Singleton?
-    --------------
-    Without Singleton, each thread might create its own connection,
-    leading to:
-    - Resource exhaustion (too many connections)
-    - Data inconsistency (different threads see different data)
-    - Lock contention (SQLite file locks)
     """
     
-    # Class-level instance (shared across all instances)
     _instance = None
     _lock = threading.Lock()
     
     def __new__(cls, db_name: str = None):
-        """
-        Override __new__ to implement Singleton pattern.
-        Ensures only one instance of DatabaseManager exists.
-        """
+        """Override __new__ to implement Singleton pattern."""
         with cls._lock:
             if cls._instance is None:
                 cls._instance = super().__new__(cls)
@@ -242,11 +216,7 @@ class DatabaseManager:
             return cls._instance
     
     def __init__(self, db_name: str = None):
-        """
-        Initialize database connection and create tables.
-        Only runs once due to Singleton pattern.
-        """
-        # Skip if already initialized (Singleton)
+        """Initialize database connection and create tables."""
         if self._initialized:
             return
         
@@ -258,13 +228,9 @@ class DatabaseManager:
         self._initialized = True
     
     def _create_tables(self) -> None:
-        """
-        Create all required database tables.
-        Uses IF NOT EXISTS to allow safe re-initialization.
-        """
+        """Create all required database tables."""
         with self.db_lock:
             self.cursor.executescript('''
-                -- Users table: tracks all registered users
                 CREATE TABLE IF NOT EXISTS users (
                     username TEXT PRIMARY KEY,
                     ip_address TEXT,
@@ -274,7 +240,6 @@ class DatabaseManager:
                     last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
                 
-                -- Stats table: tracks upload/download statistics per user
                 CREATE TABLE IF NOT EXISTS stats (
                     username TEXT PRIMARY KEY,
                     uploaded_bytes INTEGER DEFAULT 0,
@@ -283,7 +248,6 @@ class DatabaseManager:
                     files_received INTEGER DEFAULT 0
                 );
                 
-                -- Transfer logs: historical record of all file transfers
                 CREATE TABLE IF NOT EXISTS transfer_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     sender TEXT,
@@ -294,7 +258,6 @@ class DatabaseManager:
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
                 
-                -- Device sessions: tracks devices that have connected
                 CREATE TABLE IF NOT EXISTS device_sessions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     ip_address TEXT,
@@ -309,21 +272,18 @@ class DatabaseManager:
                     UNIQUE(ip_address, username)
                 );
                 
-                -- Banned users: users blocked from connecting
                 CREATE TABLE IF NOT EXISTS banned_users (
                     username TEXT PRIMARY KEY,
                     banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     reason TEXT DEFAULT 'No reason provided'
                 );
                 
-                -- Banned MACs: devices blocked from connecting
                 CREATE TABLE IF NOT EXISTS banned_macs (
                     mac_address TEXT PRIMARY KEY,
                     banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     reason TEXT DEFAULT 'No reason provided'
                 );
                 
-                -- Pairing requests: pending device pairing requests
                 CREATE TABLE IF NOT EXISTS pairing_requests (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     username TEXT,
@@ -336,7 +296,6 @@ class DatabaseManager:
                     used BOOLEAN DEFAULT 0
                 );
                 
-                -- Security logs: record of security events
                 CREATE TABLE IF NOT EXISTS security_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     ip_address TEXT,
@@ -346,7 +305,6 @@ class DatabaseManager:
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
                 
-                -- Transactions: tracks file transfer transactions
                 CREATE TABLE IF NOT EXISTS transactions (
                     id TEXT PRIMARY KEY,
                     connection_id TEXT,
@@ -366,10 +324,7 @@ class DatabaseManager:
     
     def register_user(self, username: str, ip: str, mac: str = "unknown", 
                       fingerprint: str = "unknown") -> None:
-        """
-        Register a new user or update existing user's last seen time.
-        Uses UPSERT (INSERT OR UPDATE) for atomic operation.
-        """
+        """Register a new user or update existing user's last seen time."""
         with self.db_lock:
             self.cursor.execute('''
                 INSERT INTO users (username, ip_address, mac_address, device_fingerprint, last_seen) 
@@ -405,8 +360,10 @@ class DatabaseManager:
         with self.db_lock:
             self.cursor.execute('''
                 UPDATE stats 
-                SET uploaded_bytes = uploaded_bytes + ?, downloaded_bytes = downloaded_bytes + ?,
-                    files_sent = files_sent + ?, files_received = files_received + ?
+                SET uploaded_bytes = MAX(0, uploaded_bytes + ?), 
+                    downloaded_bytes = MAX(0, downloaded_bytes + ?),
+                    files_sent = MAX(0, files_sent + ?), 
+                    files_received = MAX(0, files_received + ?)
                 WHERE username = ?
             ''', (uploaded, downloaded, files_sent, files_received, username))
             self.conn.commit()
@@ -495,10 +452,7 @@ class DatabaseManager:
     
     def create_pairing_request(self, username: str, ip: str, device_fingerprint: str,
                                 device_info: str) -> str:
-        """
-        Create a new pairing request and return the verification code.
-        Code is random and expires after configured time.
-        """
+        """Create a new pairing request and return the verification code."""
         code_length = CONFIG["security"]["code_length"]
         code = ''.join([str(random.randint(0, 9)) for _ in range(code_length)])
         
@@ -523,10 +477,7 @@ class DatabaseManager:
         return code
     
     def verify_pairing_code(self, code: str) -> Optional[dict]:
-        """
-        Verify a pairing code and return request info if valid.
-        Marks code as used after verification.
-        """
+        """Verify a pairing code and return request info if valid."""
         with self.db_lock:
             self.cursor.execute('''
                 SELECT username, ip_address, device_fingerprint, device_info, expires_at
@@ -606,16 +557,10 @@ class DatabaseManager:
             row = self.cursor.fetchone()
             if row:
                 return {
-                    'id': row[0],
-                    'connection_id': row[1],
-                    'username': row[2],
-                    'type': row[3],
-                    'filename': row[4],
-                    'size': row[5],
-                    'status': row[6],
-                    'bytes_transferred': row[7],
-                    'started_at': row[8],
-                    'completed_at': row[9]
+                    'id': row[0], 'connection_id': row[1], 'username': row[2],
+                    'type': row[3], 'filename': row[4], 'size': row[5],
+                    'status': row[6], 'bytes_transferred': row[7],
+                    'started_at': row[8], 'completed_at': row[9]
                 }
             return None
     
@@ -660,44 +605,40 @@ class DatabaseManager:
                 FROM device_sessions ORDER BY last_seen DESC
             ''')
             return self.cursor.fetchall()
+    
+    def get_user_info(self, username: str) -> Optional[dict]:
+        """
+        Get detailed user information by username.
+        
+        Returns:
+            Dictionary with user info or None if not found
+        """
+        with self.db_lock:
+            self.cursor.execute('''
+                SELECT username, ip_address, mac_address, device_fingerprint, first_seen, last_seen 
+                FROM users WHERE username = ?
+            ''', (username,))
+            row = self.cursor.fetchone()
+            
+            if row:
+                return {
+                    'username': row[0],
+                    'ip': row[1],
+                    'mac': row[2],
+                    'fingerprint': row[3],
+                    'first_seen': row[4],
+                    'last_seen': row[5]
+                }
+            return None
 
 
 # ============================================================================
-# CONNECTION MANAGEMENT (Advanced)
+# CONNECTION MANAGEMENT
 # ============================================================================
 
 @dataclass
 class Connection:
-    """
-    Represents a single client connection with state tracking.
-    
-    Attributes:
-    -----------
-    id : str
-        Unique identifier (UUID) for this connection
-    username : str
-        Authenticated username
-    socket : socket.socket
-        The underlying TCP socket
-    address : tuple
-        Client IP and port (ip, port)
-    state : ConnectionState
-        Current state of the connection
-    current_transaction : Optional[str]
-        ID of current transaction (if any)
-    last_activity : float
-        Timestamp of last activity (for idle detection)
-    created_at : float
-        Timestamp when connection was established
-    bytes_sent : int
-        Total bytes sent to client
-    bytes_received : int
-        Total bytes received from client
-    mac_address : str
-        Client MAC address (if available)
-    device_fingerprint : str
-        Unique device identifier
-    """
+    """Represents a single client connection with state tracking."""
     id: str
     username: str
     socket: socket.socket
@@ -723,20 +664,9 @@ class ConnectionManager:
     3. Provide connection lookup by ID or username
     4. Track connection statistics
     5. Detect and clean up zombie connections
-    
-    Thread Safety:
-    --------------
-    All operations protected by threading.Lock to prevent race conditions
-    when multiple threads access connections simultaneously.
     """
     
     def __init__(self, max_connections: int = None):
-        """
-        Initialize connection manager.
-        
-        Args:
-            max_connections: Maximum number of concurrent connections
-        """
         self.max_connections = max_connections or CONFIG["server"]["max_clients"]
         self._connections: Dict[str, Connection] = {}
         self._lock = threading.Lock()
@@ -745,32 +675,17 @@ class ConnectionManager:
     def register(self, username: str, client_socket: socket.socket, 
                  address: tuple, mac_address: str = "unknown",
                  device_fingerprint: str = "") -> Optional[Connection]:
-        """
-        Register a new connection.
-        
-        Args:
-            username: Authenticated username
-            client_socket: TCP socket
-            address: Client address tuple (ip, port)
-            mac_address: Client MAC address
-            device_fingerprint: Unique device identifier
-        
-        Returns:
-            Connection object if successful, None if max connections reached
-        """
+        """Register a new connection."""
         with self._lock:
-            # Check if max connections reached
             if len(self._connections) >= self.max_connections:
                 logging.warning(f"Max connections reached ({self.max_connections})")
                 return None
             
-            # Check if username already connected
             for conn in self._connections.values():
                 if conn.username == username:
                     logging.warning(f"Username '{username}' already connected")
                     return None
             
-            # Create new connection
             connection_id = str(uuid.uuid4())
             connection = Connection(
                 id=connection_id,
@@ -787,41 +702,20 @@ class ConnectionManager:
             return connection
     
     def unregister(self, connection_id: str) -> None:
-        """
-        Remove a connection from tracking.
-        
-        Args:
-            connection_id: UUID of connection to remove
-        """
+        """Remove a connection from tracking."""
         with self._lock:
             if connection_id in self._connections:
                 conn = self._connections[connection_id]
                 del self._connections[connection_id]
-                logging.info(f"Connection unregistered: {connection_id} for user '{conn.username}'")
+                logging.info(f"Connection unregistered: {connection_id}")
     
     def get_connection(self, connection_id: str) -> Optional[Connection]:
-        """
-        Get a connection by ID.
-        
-        Args:
-            connection_id: UUID of connection
-        
-        Returns:
-            Connection object if found, None otherwise
-        """
+        """Get a connection by ID."""
         with self._lock:
             return self._connections.get(connection_id)
     
     def get_by_username(self, username: str) -> Optional[Connection]:
-        """
-        Get a connection by username.
-        
-        Args:
-            username: Username to search for
-        
-        Returns:
-            Connection object if found, None otherwise
-        """
+        """Get a connection by username."""
         with self._lock:
             for conn in self._connections.values():
                 if conn.username == username:
@@ -829,63 +723,34 @@ class ConnectionManager:
             return None
     
     def update_state(self, connection_id: str, state: ConnectionState) -> None:
-        """
-        Update connection state.
-        
-        Args:
-            connection_id: UUID of connection
-            state: New state
-        """
+        """Update connection state."""
         with self._lock:
             if connection_id in self._connections:
                 self._connections[connection_id].state = state
                 self._connections[connection_id].last_activity = time.time()
     
     def set_current_transaction(self, connection_id: str, transaction_id: str) -> None:
-        """
-        Associate a transaction with a connection.
-        
-        Args:
-            connection_id: UUID of connection
-            transaction_id: UUID of transaction
-        """
+        """Associate a transaction with a connection."""
         with self._lock:
             if connection_id in self._connections:
                 self._connections[connection_id].current_transaction = transaction_id
                 self._connections[connection_id].state = ConnectionState.TRANSFERRING
     
     def clear_current_transaction(self, connection_id: str) -> None:
-        """
-        Clear current transaction from connection.
-        
-        Args:
-            connection_id: UUID of connection
-        """
+        """Clear current transaction from connection."""
         with self._lock:
             if connection_id in self._connections:
                 self._connections[connection_id].current_transaction = None
                 self._connections[connection_id].state = ConnectionState.IDLE
     
     def update_activity(self, connection_id: str) -> None:
-        """
-        Update last activity timestamp (for heartbeat/idle detection).
-        
-        Args:
-            connection_id: UUID of connection
-        """
+        """Update last activity timestamp."""
         with self._lock:
             if connection_id in self._connections:
                 self._connections[connection_id].last_activity = time.time()
     
     def update_bytes(self, connection_id: str, sent: int = 0, received: int = 0) -> None:
-        """
-        Update byte counters for a connection.
-        
-        Args:
-            connection_id: UUID of connection
-            sent: Bytes sent
-            received: Bytes received
-        """
+        """Update byte counters for a connection."""
         with self._lock:
             if connection_id in self._connections:
                 self._connections[connection_id].bytes_sent += sent
@@ -897,15 +762,7 @@ class ConnectionManager:
             return list(self._connections.values())
     
     def get_idle_connections(self, timeout: int = None) -> List[Connection]:
-        """
-        Get connections that have been idle for longer than timeout.
-        
-        Args:
-            timeout: Seconds of inactivity before considered idle
-        
-        Returns:
-            List of idle connections
-        """
+        """Get connections that have been idle for longer than timeout."""
         timeout = timeout or CONFIG["connections"]["idle_timeout"]
         now = time.time()
         
@@ -918,15 +775,7 @@ class ConnectionManager:
             return idle
     
     def get_zombie_connections(self, timeout: int = None) -> List[Connection]:
-        """
-        Get connections that appear to be dead (no activity for long time).
-        
-        Args:
-            timeout: Seconds of inactivity before considered zombie
-        
-        Returns:
-            List of zombie connections
-        """
+        """Get connections that appear to be dead."""
         timeout = timeout or CONFIG["connections"]["heartbeat_timeout"]
         now = time.time()
         
@@ -938,12 +787,7 @@ class ConnectionManager:
             return zombies
     
     def get_stats(self) -> dict:
-        """
-        Get comprehensive connection statistics.
-        
-        Returns:
-            Dictionary with connection statistics
-        """
+        """Get comprehensive connection statistics."""
         with self._lock:
             total = len(self._connections)
             active = sum(1 for c in self._connections.values() 
@@ -968,12 +812,7 @@ class ConnectionManager:
             }
     
     def cleanup(self) -> int:
-        """
-        Clean up zombie connections.
-        
-        Returns:
-            Number of connections cleaned up
-        """
+        """Clean up zombie connections."""
         zombies = self.get_zombie_connections()
         cleaned = 0
         
@@ -984,7 +823,7 @@ class ConnectionManager:
                 pass
             self.unregister(conn.id)
             cleaned += 1
-            logging.warning(f"Cleaned up zombie connection: {conn.id} (user: {conn.username})")
+            logging.warning(f"Cleaned up zombie connection: {conn.id}")
         
         return cleaned
 
@@ -995,30 +834,7 @@ class ConnectionManager:
 
 @dataclass
 class Transaction:
-    """
-    Represents a file transfer transaction with progress tracking.
-    
-    Attributes:
-    -----------
-    id : str
-        Unique identifier (UUID) for this transaction
-    connection_id : str
-        ID of the connection handling this transaction
-    username : str
-        Username performing the transfer
-    type : str
-        Type of transfer ('upload' or 'download')
-    filename : str
-        Name of file being transferred
-    size : int
-        Total size of file in bytes
-    status : TransactionStatus
-        Current status of transaction
-    bytes_transferred : int
-        Number of bytes transferred so far
-    started_at : float
-        Timestamp when transaction started
-    """
+    """Represents a file transfer transaction with progress tracking."""
     id: str
     connection_id: str
     username: str
@@ -1038,44 +854,16 @@ class Transaction:
 
 
 class TransactionManager:
-    """
-    Manages file transfer transactions with progress tracking.
-    
-    Responsibilities:
-    -----------------
-    1. Create and track transactions
-    2. Update progress
-    3. Handle transaction completion/failure
-    4. Provide transaction lookup
-    5. Persist transactions to database
-    """
+    """Manages file transfer transactions with progress tracking."""
     
     def __init__(self, db: DatabaseManager):
-        """
-        Initialize transaction manager.
-        
-        Args:
-            db: DatabaseManager instance for persistence
-        """
         self.db = db
         self._transactions: Dict[str, Transaction] = {}
         self._lock = threading.Lock()
     
     def create_transaction(self, connection_id: str, username: str, 
                            tx_type: str, filename: str, size: int) -> Transaction:
-        """
-        Create a new transaction.
-        
-        Args:
-            connection_id: ID of connection
-            username: Username
-            tx_type: 'upload' or 'download'
-            filename: Name of file
-            size: Size in bytes
-        
-        Returns:
-            Transaction object
-        """
+        """Create a new transaction."""
         transaction_id = str(uuid.uuid4())
         
         transaction = Transaction(
@@ -1090,7 +878,6 @@ class TransactionManager:
         with self._lock:
             self._transactions[transaction_id] = transaction
         
-        # Persist to database
         self.db.create_transaction(
             transaction_id, connection_id, username, tx_type, filename, size
         )
@@ -1100,50 +887,27 @@ class TransactionManager:
         return transaction
     
     def get_transaction(self, transaction_id: str) -> Optional[Transaction]:
-        """
-        Get a transaction by ID.
-        
-        Args:
-            transaction_id: UUID of transaction
-        
-        Returns:
-            Transaction object if found, None otherwise
-        """
+        """Get a transaction by ID."""
         with self._lock:
             return self._transactions.get(transaction_id)
     
     def update_progress(self, transaction_id: str, bytes_transferred: int) -> None:
-        """
-        Update transaction progress.
-        
-        Args:
-            transaction_id: UUID of transaction
-            bytes_transferred: Bytes transferred so far
-        """
+        """Update transaction progress."""
         with self._lock:
             if transaction_id in self._transactions:
                 self._transactions[transaction_id].bytes_transferred = bytes_transferred
         
-        # Persist to database
         self.db.update_transaction_progress(transaction_id, bytes_transferred)
     
     def complete_transaction(self, transaction_id: str, success: bool = True) -> None:
-        """
-        Mark transaction as completed.
-        
-        Args:
-            transaction_id: UUID of transaction
-            success: True if successful, False if failed
-        """
+        """Mark transaction as completed."""
         status = TransactionStatus.COMPLETED if success else TransactionStatus.FAILED
         
         with self._lock:
             if transaction_id in self._transactions:
                 self._transactions[transaction_id].status = status
         
-        # Persist to database
         self.db.complete_transaction(transaction_id, status.value)
-        
         logging.info(f"Transaction {transaction_id} {status.value}")
     
     def get_active_transactions(self) -> List[Transaction]:
@@ -1176,28 +940,9 @@ class TransactionManager:
 # ============================================================================
 
 class HeartbeatMonitor:
-    """
-    Monitors connection health and cleans up dead connections.
-    
-    Responsibilities:
-    -----------------
-    1. Send periodic PING messages to clients
-    2. Detect connections that don't respond
-    3. Clean up zombie connections
-    4. Log connection health metrics
-    
-    Implementation:
-    ---------------
-    Runs in a separate daemon thread, checking connections at regular intervals.
-    """
+    """Monitors connection health and cleans up dead connections."""
     
     def __init__(self, connection_manager: ConnectionManager):
-        """
-        Initialize heartbeat monitor.
-        
-        Args:
-            connection_manager: ConnectionManager instance
-        """
         self.connection_manager = connection_manager
         self.running = False
         self.thread = None
@@ -1227,22 +972,16 @@ class HeartbeatMonitor:
         
         while self.running:
             try:
-                # Check for zombie connections
                 zombies = self.connection_manager.get_zombie_connections()
                 if zombies:
                     logging.warning(f"Detected {len(zombies)} zombie connections")
                 
-                # Periodic cleanup
                 now = time.time()
                 if now - last_cleanup > cleanup_interval:
                     cleaned = self.connection_manager.cleanup()
                     if cleaned > 0:
                         logging.info(f"Cleaned up {cleaned} zombie connections")
                     last_cleanup = now
-                
-                # Log stats periodically
-                stats = self.connection_manager.get_stats()
-                logging.debug(f"Connection stats: {stats}")
                 
                 time.sleep(interval)
             
@@ -1252,60 +991,31 @@ class HeartbeatMonitor:
 
 
 # ============================================================================
-# RATE LIMITER (Security)
+# RATE LIMITER
 # ============================================================================
 
 class RateLimiter:
-    """
-    Prevents brute force attacks by limiting connection attempts.
-    
-    Algorithm: Sliding Window Log
-    -----------------------------
-    Tracks timestamps of recent attempts from each IP.
-    Rejects new attempts if count exceeds limit within time window.
-    
-    Thread Safety:
-    --------------
-    Uses threading.Lock to protect shared data structures.
-    """
+    """Prevents brute force attacks by limiting connection attempts."""
     
     def __init__(self, max_attempts: int = None, window_seconds: int = None):
-        """
-        Initialize rate limiter.
-        
-        Args:
-            max_attempts: Maximum attempts allowed in window
-            window_seconds: Time window in seconds
-        """
         self.max_attempts = max_attempts or CONFIG["security"]["max_auth_attempts"]
         self.window = window_seconds or CONFIG["security"]["rate_limit_window"]
-        self.attempts = defaultdict(list)  # {ip: [timestamps]}
+        self.attempts = defaultdict(list)
         self.lock = threading.Lock()
     
     def is_allowed(self, ip: str) -> bool:
-        """
-        Check if IP is allowed to connect.
-        
-        Args:
-            ip: IP address to check
-        
-        Returns:
-            True if allowed, False if rate limited
-        """
+        """Check if IP is allowed to connect."""
         now = time.time()
         
         with self.lock:
-            # Remove old attempts outside window
             self.attempts[ip] = [
                 t for t in self.attempts[ip] 
                 if now - t < self.window
             ]
             
-            # Check if exceeded limit
             if len(self.attempts[ip]) >= self.max_attempts:
                 return False
             
-            # Record this attempt
             self.attempts[ip].append(now)
             return True
     
@@ -1329,20 +1039,11 @@ class RateLimiter:
 
 
 # ============================================================================
-# INPUT VALIDATOR (Security)
+# INPUT VALIDATOR
 # ============================================================================
 
 class InputValidator:
-    """
-    Validates all inputs to prevent injection attacks.
-    
-    Security Measures:
-    ------------------
-    1. IP validation using ipaddress module
-    2. Filename sanitization to prevent path traversal
-    3. Username validation with regex
-    4. Port number validation
-    """
+    """Validates all inputs to prevent injection attacks."""
     
     @staticmethod
     def validate_ip(ip_string: str) -> bool:
@@ -1355,23 +1056,12 @@ class InputValidator:
     
     @staticmethod
     def validate_filename(filename: str) -> Optional[str]:
-        """
-        Validate filename to prevent path traversal.
-        
-        Args:
-            filename: Filename to validate
-        
-        Returns:
-            Sanitized filename if valid, None otherwise
-        """
-        # Remove path separators (prevent ../ attacks)
+        """Validate filename to prevent path traversal."""
         filename = os.path.basename(filename)
         
-        # Check for dangerous characters
         if any(c in filename for c in ['/', '\\', '..', '\x00']):
             return None
         
-        # Check length
         if len(filename) > 255 or len(filename) == 0:
             return None
         
@@ -1388,14 +1078,7 @@ class InputValidator:
     
     @staticmethod
     def validate_username(username: str) -> bool:
-        """
-        Validate username.
-        
-        Rules:
-        ------
-        - Only alphanumeric and underscore
-        - Length between 3 and 32 characters
-        """
+        """Validate username."""
         if not re.match(r'^[a-zA-Z0-9_]+$', username):
             return False
         
@@ -1406,34 +1089,15 @@ class InputValidator:
 
 
 # ============================================================================
-# JSON PROTOCOL (Security)
+# JSON PROTOCOL
 # ============================================================================
 
 class JsonProtocol:
-    """
-    JSON-based protocol with length prefix.
-    
-    Security Benefits:
-    ------------------
-    1. Prevents command injection (no string parsing)
-    2. Prevents data corruption (structured format)
-    3. Length prefix prevents buffer overflow
-    4. JSON validation ensures data integrity
-    
-    Format:
-    -------
-    [4 bytes: length][JSON data]
-    """
+    """JSON-based protocol with length prefix."""
     
     @staticmethod
     def send_message(sock: socket.socket, data: dict) -> None:
-        """
-        Send JSON message with length prefix.
-        
-        Args:
-            sock: Socket to send on
-            data: Dictionary to send
-        """
+        """Send JSON message with length prefix."""
         message = json.dumps(data)
         encoded = message.encode('utf-8')
         length = len(encoded).to_bytes(4, 'big')
@@ -1441,32 +1105,20 @@ class JsonProtocol:
     
     @staticmethod
     def recv_message(sock: socket.socket, timeout: int = None) -> Optional[dict]:
-        """
-        Receive JSON message with length prefix.
-        
-        Args:
-            sock: Socket to receive from
-            timeout: Optional timeout in seconds
-        
-        Returns:
-            Received dictionary or None on error
-        """
+        """Receive JSON message with length prefix."""
         if timeout:
             sock.settimeout(timeout)
         
         try:
-            # Read length prefix (4 bytes)
             length_bytes = sock.recv(4)
             if len(length_bytes) < 4:
                 return None
             
             length = int.from_bytes(length_bytes, 'big')
             
-            # Sanity check (prevent memory exhaustion)
-            if length > 10 * 1024 * 1024:  # 10MB max
+            if length > 10 * 1024 * 1024:
                 return None
             
-            # Read message body
             message_bytes = sock.recv(length)
             if len(message_bytes) < length:
                 return None
@@ -1484,27 +1136,10 @@ class JsonProtocol:
 # ============================================================================
 
 class Command(ABC):
-    """
-    Abstract base class for protocol commands.
-    
-    Command Pattern Benefits:
-    -------------------------
-    1. Encapsulates command logic in separate classes
-    2. Makes adding new commands easy (just create new class)
-    3. Separates command invocation from execution
-    4. Enables command queuing and undo operations
-    """
+    """Abstract base class for protocol commands."""
     
     @abstractmethod
     def execute(self, client: socket.socket, data: dict, context: dict) -> None:
-        """
-        Execute the command.
-        
-        Args:
-            client: Client socket
-            data: Command data (parsed JSON)
-            context: Execution context (username, connection_id, etc.)
-        """
         pass
 
 
@@ -1521,7 +1156,6 @@ class UploadCommand(Command):
         self.connection_manager = connection_manager
     
     def execute(self, client: socket.socket, data: dict, context: dict) -> None:
-        """Execute upload command."""
         file_name = InputValidator.validate_filename(data.get('filename', ''))
         if not file_name:
             JsonProtocol.send_message(client, {"type": "ERROR", "message": "Invalid filename"})
@@ -1532,18 +1166,14 @@ class UploadCommand(Command):
         username = context['username']
         connection_id = context['connection_id']
         
-        # Check file size limit
         max_size = CONFIG["server"]["max_file_size_mb"] * 1024 * 1024
         if max_size > 0 and file_size > max_size:
             JsonProtocol.send_message(client, {"type": "ERROR", "message": "File too large"})
             return
         
-        # Create transaction
         transaction = self.transaction_manager.create_transaction(
             connection_id, username, 'upload', file_name, file_size
         )
-        
-        # Update connection state
         self.connection_manager.set_current_transaction(connection_id, transaction.id)
         
         save_path = os.path.join(self.shared_folder, file_name)
@@ -1559,11 +1189,9 @@ class UploadCommand(Command):
                     f.write(chunk)
                     received_size += len(chunk)
                     
-                    # Update progress
                     self.transaction_manager.update_progress(transaction.id, received_size)
                     self.connection_manager.update_bytes(connection_id, received=received_size)
             
-            # Verify integrity
             if FileTransferUtils.calculate_sha256(save_path) == file_sha256:
                 JsonProtocol.send_message(client, {"type": "FILE_OK"})
                 self.db.update_stats(username, uploaded=file_size, files_received=1)
@@ -1582,7 +1210,6 @@ class UploadCommand(Command):
             self.transaction_manager.complete_transaction(transaction.id, success=False)
         
         finally:
-            # Clear transaction from connection
             self.connection_manager.clear_current_transaction(connection_id)
 
 
@@ -1599,7 +1226,6 @@ class DownloadCommand(Command):
         self.connection_manager = connection_manager
     
     def execute(self, client: socket.socket, data: dict, context: dict) -> None:
-        """Execute download command."""
         file_name = InputValidator.validate_filename(data.get('filename', ''))
         if not file_name:
             JsonProtocol.send_message(client, {"type": "ERROR", "message": "Invalid filename"})
@@ -1616,12 +1242,9 @@ class DownloadCommand(Command):
         file_size = os.path.getsize(file_path)
         file_sha256 = FileTransferUtils.calculate_sha256(file_path)
         
-        # Create transaction
         transaction = self.transaction_manager.create_transaction(
             connection_id, username, 'download', file_name, file_size
         )
-        
-        # Update connection state
         self.connection_manager.set_current_transaction(connection_id, transaction.id)
         
         try:
@@ -1632,7 +1255,6 @@ class DownloadCommand(Command):
                 "sha256": file_sha256
             })
             
-            # Wait for READY signal
             ready_msg = JsonProtocol.recv_message(client)
             if not ready_msg or ready_msg.get('type') != 'READY':
                 return
@@ -1646,7 +1268,6 @@ class DownloadCommand(Command):
                     client.send(chunk)
                     sent_size += len(chunk)
                     
-                    # Update progress
                     self.transaction_manager.update_progress(transaction.id, sent_size)
                     self.connection_manager.update_bytes(connection_id, sent=sent_size)
             
@@ -1662,7 +1283,6 @@ class DownloadCommand(Command):
             self.transaction_manager.complete_transaction(transaction.id, success=False)
         
         finally:
-            # Clear transaction from connection
             self.connection_manager.clear_current_transaction(connection_id)
 
 
@@ -1673,7 +1293,6 @@ class ListCommand(Command):
         self.shared_folder = shared_folder
     
     def execute(self, client: socket.socket, data: dict, context: dict) -> None:
-        """Execute list command."""
         files = []
         for f in os.listdir(self.shared_folder):
             full_path = os.path.join(self.shared_folder, f)
@@ -1693,7 +1312,6 @@ class UsersCommand(Command):
         self.connection_manager = connection_manager
     
     def execute(self, client: socket.socket, data: dict, context: dict) -> None:
-        """Execute users command."""
         connections = self.connection_manager.get_all_connections()
         
         if not connections:
@@ -1721,7 +1339,6 @@ class StatsCommand(Command):
         self.db = db
     
     def execute(self, client: socket.socket, data: dict, context: dict) -> None:
-        """Execute stats command."""
         username = context['username']
         stats = self.db.get_stats(username)
         
@@ -1747,11 +1364,9 @@ class QuitCommand(Command):
         self.connection_manager = connection_manager
     
     def execute(self, client: socket.socket, data: dict, context: dict) -> None:
-        """Execute quit command."""
         connection_id = context['connection_id']
         username = context['username']
         
-        # Update connection state
         self.connection_manager.update_state(connection_id, ConnectionState.CLOSING)
         
         self.event_bus.publish('user_disconnected', {
@@ -1760,25 +1375,437 @@ class QuitCommand(Command):
 
 
 # ============================================================================
+# NEW COMMANDS: File Management (v4.0.0)
+# ============================================================================
+
+class DeleteCommand(Command):
+    """Handles file deletion requests."""
+    
+    def __init__(self, event_bus: EventBus, db: DatabaseManager, 
+                 shared_folder: str):
+        self.event_bus = event_bus
+        self.db = db
+        self.shared_folder = shared_folder
+    
+    def execute(self, client: socket.socket, data: dict, context: dict) -> None:
+        file_name = InputValidator.validate_filename(data.get('filename', ''))
+        if not file_name:
+            JsonProtocol.send_message(client, {
+                "type": "ERROR", 
+                "message": "Invalid filename"
+            })
+            return
+        
+        file_path = os.path.join(self.shared_folder, file_name)
+        username = context['username']
+        
+        if not os.path.isfile(file_path):
+            JsonProtocol.send_message(client, {
+                "type": "ERROR", 
+                "message": "File not found"
+            })
+            return
+        
+        try:
+            file_size = os.path.getsize(file_path)
+            os.remove(file_path)
+            
+            JsonProtocol.send_message(client, {
+                "type": "DELETE_OK",
+                "filename": file_name
+            })
+            
+            self.db.update_stats(username, uploaded=-file_size, files_received=-1)
+            self.db.log_transfer(username, "Server", file_name, file_size, "DELETED")
+            
+            self.event_bus.publish('file_deleted', {
+                'username': username,
+                'filename': file_name,
+                'size': file_size
+            })
+            
+            logging.info(f"File deleted: {file_name} by {username}")
+        
+        except Exception as e:
+            logging.error(f"Delete error: {e}")
+            JsonProtocol.send_message(client, {
+                "type": "ERROR",
+                "message": f"Delete failed: {str(e)}"
+            })
+
+
+class RenameCommand(Command):
+    """Handles file rename requests."""
+    
+    def __init__(self, db: DatabaseManager, shared_folder: str):
+        self.db = db
+        self.shared_folder = shared_folder
+    
+    def execute(self, client: socket.socket, data: dict, context: dict) -> None:
+        old_name = InputValidator.validate_filename(data.get('old_name', ''))
+        new_name = InputValidator.validate_filename(data.get('new_name', ''))
+        
+        if not old_name or not new_name:
+            JsonProtocol.send_message(client, {
+                "type": "ERROR",
+                "message": "Invalid filename(s)"
+            })
+            return
+        
+        old_path = os.path.join(self.shared_folder, old_name)
+        new_path = os.path.join(self.shared_folder, new_name)
+        
+        if not os.path.isfile(old_path):
+            JsonProtocol.send_message(client, {
+                "type": "ERROR",
+                "message": "Source file not found"
+            })
+            return
+        
+        if os.path.exists(new_path):
+            JsonProtocol.send_message(client, {
+                "type": "ERROR",
+                "message": "Target filename already exists"
+            })
+            return
+        
+        try:
+            os.rename(old_path, new_path)
+            
+            JsonProtocol.send_message(client, {
+                "type": "RENAME_OK",
+                "old_name": old_name,
+                "new_name": new_name
+            })
+            
+            self.db.log_transfer(
+                context['username'], "Server", 
+                f"{old_name} → {new_name}", 0, "RENAMED"
+            )
+            
+            logging.info(f"File renamed: {old_name} → {new_name} by {context['username']}")
+        
+        except Exception as e:
+            logging.error(f"Rename error: {e}")
+            JsonProtocol.send_message(client, {
+                "type": "ERROR",
+                "message": f"Rename failed: {str(e)}"
+            })
+
+
+class SearchCommand(Command):
+    """Handles file search requests with pattern matching."""
+    
+    def __init__(self, shared_folder: str):
+        self.shared_folder = shared_folder
+    
+    def execute(self, client: socket.socket, data: dict, context: dict) -> None:
+        pattern = data.get('pattern', '').strip()
+        
+        if not pattern:
+            JsonProtocol.send_message(client, {
+                "type": "ERROR",
+                "message": "Empty search pattern"
+            })
+            return
+        
+        regex_pattern = fnmatch.translate(pattern)
+        regex = re.compile(regex_pattern, re.IGNORECASE)
+        
+        matches = []
+        try:
+            for filename in os.listdir(self.shared_folder):
+                full_path = os.path.join(self.shared_folder, filename)
+                if os.path.isfile(full_path) and regex.match(filename):
+                    matches.append({
+                        "name": filename,
+                        "size": os.path.getsize(full_path)
+                    })
+            
+            matches.sort(key=lambda x: x['name'].lower())
+            
+            JsonProtocol.send_message(client, {
+                "type": "SEARCH_RESULTS",
+                "pattern": pattern,
+                "count": len(matches),
+                "files": matches
+            })
+        
+        except Exception as e:
+            logging.error(f"Search error: {e}")
+            JsonProtocol.send_message(client, {
+                "type": "ERROR",
+                "message": f"Search failed: {str(e)}"
+            })
+
+
+# ============================================================================
+# NEW COMMANDS: Resume Transfers (v4.0.0)
+# ============================================================================
+
+class ResumeUploadCommand(Command):
+    """Handles resumed file uploads."""
+    
+    def __init__(self, event_bus: EventBus, db: DatabaseManager, 
+                 shared_folder: str, transaction_manager: TransactionManager,
+                 connection_manager: ConnectionManager):
+        self.event_bus = event_bus
+        self.db = db
+        self.shared_folder = shared_folder
+        self.transaction_manager = transaction_manager
+        self.connection_manager = connection_manager
+    
+    def execute(self, client: socket.socket, data: dict, context: dict) -> None:
+        file_name = InputValidator.validate_filename(data.get('filename', ''))
+        if not file_name:
+            JsonProtocol.send_message(client, {
+                "type": "ERROR",
+                "message": "Invalid filename"
+            })
+            return
+        
+        file_size = data.get('size', 0)
+        file_sha256 = data.get('sha256', '')
+        offset = data.get('offset', 0)
+        username = context['username']
+        connection_id = context['connection_id']
+        
+        save_path = os.path.join(self.shared_folder, file_name)
+        
+        if not os.path.isfile(save_path):
+            JsonProtocol.send_message(client, {
+                "type": "ERROR",
+                "message": "No partial file found. Start fresh upload."
+            })
+            return
+        
+        existing_size = os.path.getsize(save_path)
+        
+        if existing_size != offset:
+            JsonProtocol.send_message(client, {
+                "type": "ERROR",
+                "message": f"Offset mismatch. Server has {existing_size} bytes, client sent offset {offset}"
+            })
+            return
+        
+        max_size = CONFIG["server"]["max_file_size_mb"] * 1024 * 1024
+        if max_size > 0 and file_size > max_size:
+            JsonProtocol.send_message(client, {
+                "type": "ERROR",
+                "message": "File too large"
+            })
+            return
+        
+        transaction = self.transaction_manager.create_transaction(
+            connection_id, username, 'resume_upload', file_name, file_size - offset
+        )
+        self.connection_manager.set_current_transaction(connection_id, transaction.id)
+        
+        JsonProtocol.send_message(client, {
+            "type": "RESUME_OK",
+            "offset": offset
+        })
+        
+        received_size = offset
+        try:
+            with open(save_path, 'ab') as f:
+                while received_size < file_size:
+                    chunk_size = min(4096, file_size - received_size)
+                    chunk = client.recv(chunk_size)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    received_size += len(chunk)
+                    
+                    self.transaction_manager.update_progress(
+                        transaction.id, received_size - offset
+                    )
+                    self.connection_manager.update_bytes(
+                        connection_id, received=received_size - offset
+                    )
+            
+            if FileTransferUtils.calculate_sha256(save_path) == file_sha256:
+                JsonProtocol.send_message(client, {"type": "FILE_OK"})
+                self.db.update_stats(username, uploaded=file_size - offset, files_received=1)
+                self.db.log_transfer(username, "Server", file_name, file_size, "RESUMED")
+                self.transaction_manager.complete_transaction(transaction.id, success=True)
+                self.event_bus.publish('file_uploaded', {
+                    'username': username, 'filename': file_name, 
+                    'size': file_size, 'resumed': True
+                })
+            else:
+                JsonProtocol.send_message(client, {"type": "FILE_CORRUPTED"})
+                self.db.log_transfer(username, "Server", file_name, file_size, "CORRUPTED")
+                self.transaction_manager.complete_transaction(transaction.id, success=False)
+        
+        except Exception as e:
+            logging.error(f"Resume upload error: {e}")
+            self.transaction_manager.complete_transaction(transaction.id, success=False)
+        
+        finally:
+            self.connection_manager.clear_current_transaction(connection_id)
+
+
+class ResumeDownloadCommand(Command):
+    """Handles resumed file downloads."""
+    
+    def __init__(self, event_bus: EventBus, db: DatabaseManager, 
+                 shared_folder: str, transaction_manager: TransactionManager,
+                 connection_manager: ConnectionManager):
+        self.event_bus = event_bus
+        self.db = db
+        self.shared_folder = shared_folder
+        self.transaction_manager = transaction_manager
+        self.connection_manager = connection_manager
+    
+    def execute(self, client: socket.socket, data: dict, context: dict) -> None:
+        file_name = InputValidator.validate_filename(data.get('filename', ''))
+        if not file_name:
+            JsonProtocol.send_message(client, {
+                "type": "ERROR",
+                "message": "Invalid filename"
+            })
+            return
+        
+        offset = data.get('offset', 0)
+        file_path = os.path.join(self.shared_folder, file_name)
+        username = context['username']
+        connection_id = context['connection_id']
+        
+        if not os.path.isfile(file_path):
+            JsonProtocol.send_message(client, {
+                "type": "ERROR",
+                "message": "File not found"
+            })
+            return
+        
+        file_size = os.path.getsize(file_path)
+        
+        if offset < 0 or offset >= file_size:
+            JsonProtocol.send_message(client, {
+                "type": "ERROR",
+                "message": f"Invalid offset: {offset}. File size: {file_size}"
+            })
+            return
+        
+        file_sha256 = FileTransferUtils.calculate_sha256(file_path)
+        remaining_size = file_size - offset
+        
+        transaction = self.transaction_manager.create_transaction(
+            connection_id, username, 'resume_download', file_name, remaining_size
+        )
+        self.connection_manager.set_current_transaction(connection_id, transaction.id)
+        
+        JsonProtocol.send_message(client, {
+            "type": "RESUME_META",
+            "filename": file_name,
+            "size": file_size,
+            "offset": offset,
+            "remaining": remaining_size,
+            "sha256": file_sha256
+        })
+        
+        ready_msg = JsonProtocol.recv_message(client)
+        if not ready_msg or ready_msg.get('type') != 'READY':
+            return
+        
+        sent_size = 0
+        try:
+            with open(file_path, 'rb') as f:
+                f.seek(offset)
+                
+                while sent_size < remaining_size:
+                    chunk = f.read(4096)
+                    if not chunk:
+                        break
+                    client.send(chunk)
+                    sent_size += len(chunk)
+                    
+                    self.transaction_manager.update_progress(transaction.id, sent_size)
+                    self.connection_manager.update_bytes(connection_id, sent=sent_size)
+            
+            self.db.update_stats(username, downloaded=remaining_size, files_sent=1)
+            self.db.log_transfer("Server", username, file_name, remaining_size, "RESUMED")
+            self.transaction_manager.complete_transaction(transaction.id, success=True)
+            self.event_bus.publish('file_downloaded', {
+                'username': username, 'filename': file_name,
+                'size': remaining_size, 'resumed': True
+            })
+        
+        except Exception as e:
+            logging.error(f"Resume download error: {e}")
+            self.transaction_manager.complete_transaction(transaction.id, success=False)
+        
+        finally:
+            self.connection_manager.clear_current_transaction(connection_id)
+
+
+# ============================================================================
+# NEW COMMAND: Server Fingerprint (Safety Numbers) - v4.0.0
+# ============================================================================
+
+class ServerFingerprintCommand(Command):
+    """
+    Returns server's certificate fingerprint for Safety Numbers verification.
+    
+    Purpose:
+    --------
+    Prevents Server Spoofing attacks. User compares the safety numbers
+    shown on client with those shown on server admin console.
+    """
+    
+    def __init__(self, cert_file: str):
+        self.cert_file = cert_file
+    
+    def execute(self, client: socket.socket, data: dict, context: dict) -> None:
+        try:
+            if not os.path.exists(self.cert_file):
+                JsonProtocol.send_message(client, {
+                    "type": "ERROR",
+                    "message": "Certificate not available"
+                })
+                return
+            
+            with open(self.cert_file, 'rb') as f:
+                cert_data = f.read()
+            
+            fingerprint = hashlib.sha256(cert_data).hexdigest()
+            
+            safety_numbers = []
+            for i in range(0, 25, 5):
+                chunk = fingerprint[i:i+5]
+                num = int(chunk, 16) % 100000
+                safety_numbers.append(f"{num:05d}")
+            
+            safety_string = "-".join(safety_numbers)
+            
+            JsonProtocol.send_message(client, {
+                "type": "SERVER_FINGERPRINT",
+                "safety_numbers": safety_string,
+                "fingerprint": fingerprint[:32]
+            })
+        
+        except Exception as e:
+            logging.error(f"Fingerprint error: {e}")
+            JsonProtocol.send_message(client, {
+                "type": "ERROR",
+                "message": "Could not generate fingerprint"
+            })
+
+
+# ============================================================================
 # DESIGN PATTERN: Factory
 # ============================================================================
 
 class CommandFactory:
-    """
-    Factory Pattern for creating command instances.
-    
-    Benefits:
-    ---------
-    1. Centralizes command registration
-    2. Makes adding new commands easy
-    3. Separates command creation from usage
-    """
+    """Factory Pattern for creating command instances."""
     
     def __init__(self, event_bus: EventBus, db: DatabaseManager, 
                  connection_manager: ConnectionManager,
                  transaction_manager: TransactionManager,
-                 shared_folder: str):
+                 shared_folder: str, cert_file: str):
         self.commands = {
+            # Core commands
             "UPLOAD": UploadCommand(event_bus, db, shared_folder, 
                                    transaction_manager, connection_manager),
             "DOWNLOAD": DownloadCommand(event_bus, db, shared_folder,
@@ -1787,6 +1814,22 @@ class CommandFactory:
             "USERS": UsersCommand(connection_manager),
             "STATS": StatsCommand(db),
             "QUIT": QuitCommand(event_bus, connection_manager),
+            
+            # File management (v4.0.0)
+            "DELETE": DeleteCommand(event_bus, db, shared_folder),
+            "RENAME": RenameCommand(db, shared_folder),
+            "SEARCH": SearchCommand(shared_folder),
+            
+            # Resume transfers (v4.0.0)
+            "RESUME_UPLOAD": ResumeUploadCommand(
+                event_bus, db, shared_folder, transaction_manager, connection_manager
+            ),
+            "RESUME_DOWNLOAD": ResumeDownloadCommand(
+                event_bus, db, shared_folder, transaction_manager, connection_manager
+            ),
+            
+            # Security (v4.0.0)
+            "SERVER_FINGERPRINT": ServerFingerprintCommand(cert_file),
         }
     
     def get_command(self, command_name: str) -> Optional[Command]:
@@ -1830,7 +1873,6 @@ class NetworkUtils:
     @staticmethod
     def get_mac_from_ip(ip_address: str) -> str:
         """Resolve MAC address from IP using ARP table."""
-        # Validate IP first (security)
         if not InputValidator.validate_ip(ip_address):
             return "unknown"
         
@@ -1920,7 +1962,7 @@ class ServiceDiscovery:
         
         discovery_data = {
             "service": "julian",
-            "version": "3.0.0",
+            "version": "4.0.0",
             "port": self.server_port,
             "requires_auth": True,
             "tls": self.tls_enabled
@@ -1961,7 +2003,6 @@ class SecureServer:
         """Initialize server with all components."""
         self.config = config or CONFIG
         
-        # Server settings
         self.host = self.config["server"]["host"]
         self.port = self.config["server"]["port"]
         if self.port == 0:
@@ -1973,23 +2014,15 @@ class SecureServer:
         self.server_socket = None
         self.context = None
         
-        # Initialize core components
         self.event_bus = EventBus()
-        self.db = DatabaseManager()  # Singleton
+        self.db = DatabaseManager()
         self.connection_manager = ConnectionManager()
         self.transaction_manager = TransactionManager(self.db)
         self.rate_limiter = RateLimiter()
         self.heartbeat_monitor = HeartbeatMonitor(self.connection_manager)
         
-        # Initialize command factory
-        self.command_factory = CommandFactory(
-            self.event_bus, self.db, self.connection_manager,
-            self.transaction_manager, self.shared_folder
-        )
-        
         os.makedirs(self.shared_folder, exist_ok=True)
         
-        # Setup SSL
         self.ssl_enabled = self.config["security"]["tls_enabled"]
         if self.ssl_enabled:
             self.ssl_enabled = SSLManager.generate_self_signed_cert()
@@ -2000,7 +2033,13 @@ class SecureServer:
                     self.config["security"]["key_file"]
                 )
         
-        # Setup logging
+        # Initialize command factory with certificate file for fingerprinting
+        self.command_factory = CommandFactory(
+            self.event_bus, self.db, self.connection_manager,
+            self.transaction_manager, self.shared_folder,
+            self.config["security"]["cert_file"]
+        )
+        
         logging.basicConfig(
             filename=self.config["logging"]["file"],
             filemode='a',
@@ -2009,10 +2048,8 @@ class SecureServer:
             level=getattr(logging, self.config["logging"]["level"])
         )
         
-        # Setup event handlers
         self._setup_event_handlers()
         
-        # Service discovery
         self.discovery = None
         if self.config["discovery"]["enabled"]:
             self.discovery = ServiceDiscovery(self.port, self.ssl_enabled)
@@ -2023,6 +2060,7 @@ class SecureServer:
         self.event_bus.subscribe('user_disconnected', self._on_user_disconnected)
         self.event_bus.subscribe('file_uploaded', self._on_file_uploaded)
         self.event_bus.subscribe('file_downloaded', self._on_file_downloaded)
+        self.event_bus.subscribe('file_deleted', self._on_file_deleted)
         self.event_bus.subscribe('pairing_requested', self._on_pairing_requested)
         self.event_bus.subscribe('security_event', self._on_security_event)
     
@@ -2033,10 +2071,15 @@ class SecureServer:
         logging.info(f"User disconnected: {data['username']}")
     
     def _on_file_uploaded(self, data: dict) -> None:
-        logging.info(f"File uploaded: {data['filename']} by {data['username']}")
+        resumed = " (resumed)" if data.get('resumed') else ""
+        logging.info(f"File uploaded{resumed}: {data['filename']} by {data['username']}")
     
     def _on_file_downloaded(self, data: dict) -> None:
-        logging.info(f"File downloaded: {data['filename']} by {data['username']}")
+        resumed = " (resumed)" if data.get('resumed') else ""
+        logging.info(f"File downloaded{resumed}: {data['filename']} by {data['username']}")
+    
+    def _on_file_deleted(self, data: dict) -> None:
+        logging.info(f"File deleted: {data['filename']} by {data['username']}")
     
     def _on_pairing_requested(self, data: dict) -> None:
         print("\n" + "=" * 60)
@@ -2066,7 +2109,7 @@ class SecureServer:
         
         ip = NetworkUtils.get_local_ip()
         print("=" * 60)
-        print("🔒 Julian Server v3.0.0 (Advanced Connection Management)")
+        print("🔒 Julian Server v4.0.0 (Full File Management)")
         print("=" * 60)
         print(f"📍 IP: {ip} | 📌 Port: {self.port} | 🔑 Pass: {self.password}")
         print(f"🔐 Encryption: {'TLS 1.3 Enabled' if self.ssl_enabled else 'DISABLED'}")
@@ -2077,14 +2120,18 @@ class SecureServer:
         print(f"🗄️ Database: {self.config['database']['path']}")
         print(f"📁 Shared: {os.path.abspath(self.shared_folder)}")
         print("=" * 60)
+        print("New in v4.0.0:")
+        print("  ✅ Resume Transfers")
+        print("  ✅ File Management (delete, rename, search)")
+        print("  ✅ Safety Numbers (server verification)")
+        print("  ✅ Admin Code Generation (code <username>)")
+        print("=" * 60)
         print("Type 'help' for admin commands.\n")
         
-        # Start service discovery
         if self.discovery:
             self.discovery.start()
             print(f"📡 Broadcasting on port {self.config['discovery']['broadcast_port']}...")
         
-        # Start heartbeat monitor
         self.heartbeat_monitor.start()
         
         admin_thread = threading.Thread(target=self._admin_cli, daemon=True)
@@ -2122,7 +2169,6 @@ class SecureServer:
         connection = None
         
         try:
-            # Set timeout for initial authentication (Stealth Mode)
             auth_timeout = self.config["security"]["auth_timeout"]
             client.settimeout(auth_timeout)
             
@@ -2138,17 +2184,14 @@ class SecureServer:
                                     "EMPTY", "Empty or invalid initial data")
                 return
             
-            # Restore normal timeout
             client.settimeout(None)
             
-            # Check MAC ban early
             mac_address = NetworkUtils.get_mac_from_ip(addr[0])
             if self.db.is_mac_banned(mac_address):
                 self._silent_close(client, addr[0], mac_address,
                                     "BANNED_DEVICE", "Banned MAC attempted connection")
                 return
             
-            # Check rate limit
             if not self.rate_limiter.is_allowed(addr[0]):
                 remaining = self.rate_limiter.get_remaining_attempts(addr[0])
                 self._silent_close(client, addr[0], mac_address,
@@ -2156,7 +2199,6 @@ class SecureServer:
                                     f"Too many attempts. {remaining} remaining in window")
                 return
             
-            # Route to appropriate auth handler
             msg_type = initial_msg.get('type', '')
             
             if msg_type == "PAIR_REQUEST":
@@ -2184,22 +2226,18 @@ class SecureServer:
         device_info = data.get('device_info', '')
         device_fingerprint = data.get('device_fingerprint', '')
         
-        # Validate username
         if not InputValidator.validate_username(username):
             self._silent_close(client, addr[0], mac_address,
                                 "INVALID_USERNAME", f"Invalid username: {username}")
             return
         
-        # Check if username is banned
         if self.db.is_user_banned(username):
             self._silent_close(client, addr[0], mac_address,
                                 "BANNED_USER", f"Banned user '{username}' attempted pairing")
             return
         
-        # Generate pairing code
         code = self.db.create_pairing_request(username, addr[0], device_fingerprint, device_info)
         
-        # Notify admin via event bus
         self.event_bus.publish('pairing_requested', {
             'username': username,
             'device_info': device_info,
@@ -2207,10 +2245,8 @@ class SecureServer:
             'code': code
         })
         
-        # Send code to client
         JsonProtocol.send_message(client, {"type": "PAIR_CODE", "code": code})
         
-        # Wait for PAIR_CONFIRM with timeout
         code_expiry = self.config["security"]["code_expiry"]
         client.settimeout(code_expiry)
         
@@ -2228,17 +2264,14 @@ class SecureServer:
         
         entered_code = confirm_msg.get('code', '').strip()
         
-        # Verify code
         request_info = self.db.verify_pairing_code(entered_code)
         if not request_info or request_info['device_fingerprint'] != device_fingerprint:
             self._silent_close(client, addr[0], mac_address,
                                 "WRONG_CODE", f"Wrong pairing code for '{username}'")
             return
         
-        # Code valid → register device and create connection
         self.db.register_user(username, addr[0], mac_address, device_fingerprint)
         
-        # Parse device info
         os_info, distribution, device_type = "Unknown", "", "Unknown"
         if "||" in device_info:
             parts = device_info.split("||")
@@ -2248,7 +2281,6 @@ class SecureServer:
         self.db.register_device(addr[0], mac_address, username, device_fingerprint,
                                 os_info, distribution, device_type)
         
-        # Register connection
         connection = self.connection_manager.register(
             username, client, addr, mac_address, device_fingerprint
         )
@@ -2257,15 +2289,12 @@ class SecureServer:
             JsonProtocol.send_message(client, {"type": "ERROR", "message": "Max connections reached"})
             return
         
-        # Send success
         JsonProtocol.send_message(client, {"type": "PAIRED_OK"})
         
-        # Update connection state
         self.connection_manager.update_state(connection.id, ConnectionState.IDLE)
         
         print(f"✅ Device paired: {username} | {device_type} | {addr[0]}")
         
-        # Now enter command loop
         self._enter_command_loop(client, addr, mac_address, username, 
                                   device_fingerprint, connection.id)
     
@@ -2276,32 +2305,27 @@ class SecureServer:
         code = data.get('code', '').strip()
         device_fingerprint = data.get('device_fingerprint', '')
         
-        # Validate username
         if not InputValidator.validate_username(username):
             self._silent_close(client, addr[0], mac_address,
                                 "INVALID_USERNAME", f"Invalid username: {username}")
             return
         
-        # Check if user is banned
         if self.db.is_user_banned(username):
             self._silent_close(client, addr[0], mac_address,
                                 "BANNED_USER", f"Banned user '{username}'")
             return
         
-        # Verify code
         request_info = self.db.verify_pairing_code(code)
         if not request_info:
             self._silent_close(client, addr[0], mac_address,
                                 "INVALID_CODE", f"Invalid or expired code for '{username}'")
             return
         
-        # Verify device fingerprint matches
         if request_info['device_fingerprint'] != device_fingerprint:
             self._silent_close(client, addr[0], mac_address,
                                 "DEVICE_MISMATCH", f"Device fingerprint mismatch for '{username}'")
             return
         
-        # Code valid → allow login
         device_info = request_info.get('device_info', '')
         os_info, distribution, device_type = "Unknown", "", "Unknown"
         if "||" in device_info:
@@ -2309,12 +2333,10 @@ class SecureServer:
             if len(parts) >= 3:
                 os_info, distribution, device_type = parts[0], parts[1], parts[2]
         
-        # Register user and device
         self.db.register_user(username, addr[0], mac_address, device_fingerprint)
         self.db.register_device(addr[0], mac_address, username, device_fingerprint,
                                 os_info, distribution, device_type)
         
-        # Register connection
         connection = self.connection_manager.register(
             username, client, addr, mac_address, device_fingerprint
         )
@@ -2325,7 +2347,6 @@ class SecureServer:
         
         JsonProtocol.send_message(client, {"type": "LOGIN_OK", "username": username})
         
-        # Update connection state
         self.connection_manager.update_state(connection.id, ConnectionState.IDLE)
         
         self.event_bus.publish('user_connected', {
@@ -2335,7 +2356,6 @@ class SecureServer:
         
         print(f"✅ {username} | 📍 {addr[0]} | 🔗 {mac_address} (code login)")
         
-        # Enter command loop
         self._enter_command_loop(client, addr, mac_address, username,
                                   device_fingerprint, connection.id)
     
@@ -2350,7 +2370,6 @@ class SecureServer:
                     if not msg:
                         break
                     
-                    # Update activity timestamp
                     self.connection_manager.update_activity(connection_id)
                     
                     command_name = msg.get('type', '')
@@ -2396,12 +2415,13 @@ Commands:
   banned_macs        - Show banned MAC addresses
   connections        - Show detailed connection statistics
   transactions       - Show active transactions
+  files              - Show shared files
+  code <username>    - Generate login code for registered user
   ban <user> [reason]    - Ban a user
   unban <user>           - Unban a user
   ban_mac <mac> [reason] - Ban a device by MAC
   unban_mac <mac>        - Unban a MAC
   stats <user>           - Show user statistics
-  list                   - Show shared files
   quit                   - Exit server
                     """)
                 
@@ -2434,7 +2454,7 @@ Commands:
                     devices = self.db.get_all_devices()
                     print(f"\n🖥️ All Registered Devices ({len(devices)}):")
                     for d in devices:
-                        print(f"  📍 {d[0]} | 🔗 {d[1]} | 👤 {d[2]} | 🔏 {d[3]} | 💻 {d[4]} | 📦 {d[5]} | 📱 {d[6]} | Last: {d[7]}")
+                        print(f"  📍 {d[0]} | 🔗 {d[1]} | 👤 {d[2]} | 🔏 {d[3][:8]}... | 💻 {d[4]} | 📦 {d[5]} | 📱 {d[6]} | Last: {d[7]}")
                 
                 elif cmd.lower() == 'pending':
                     pending = self.db.get_pending_pairing_requests()
@@ -2443,7 +2463,7 @@ Commands:
                     else:
                         print(f"\n⏳ Pending Pairing Requests ({len(pending)}):")
                         for p in pending:
-                            print(f"  👤 {p[0]} | 🔑 \033[1;33m{p[1]}\033[0m | 📍 {p[2]} | 🔏 {p[3]} | 🖥️ {p[4]} | Expires: {p[5]}")
+                            print(f"  👤 {p[0]} | 🔑 \033[1;33m{p[1]}\033[0m | 📍 {p[2]} | 🔏 {p[3][:8]}... | 🖥️ {p[4]} | Expires: {p[5]}")
                 
                 elif cmd.lower() == 'security':
                     logs = self.db.get_security_logs(20)
@@ -2458,7 +2478,7 @@ Commands:
                     users = self.db.get_all_users()
                     print(f"\n📜 All Registered Users ({len(users)}):")
                     for u in users:
-                        print(f"  👤 {u[0]} | Last IP: {u[1]} | MAC: {u[2]} | 🔏 {u[3]} | Last Seen: {u[5]}")
+                        print(f"  👤 {u[0]} | Last IP: {u[1]} | MAC: {u[2]} | 🔏 {u[3][:8]}... | Last Seen: {u[5]}")
                 
                 elif cmd.lower() == 'banned':
                     banned = self.db.get_banned_users()
@@ -2471,6 +2491,61 @@ Commands:
                     print(f"\n🚫 Banned MAC Addresses ({len(banned)}):")
                     for b in banned:
                         print(f"  ❌ {b[0]} | Banned: {b[1]} | Reason: {b[2]}")
+                
+                # ====================================================================
+                # NEW: Generate login code for registered user
+                # ====================================================================
+                elif cmd.lower().startswith('code '):
+                    parts = cmd.split(' ', 1)
+                    if len(parts) == 2:
+                        username = parts[1].strip()
+                        
+                        # Validate username format
+                        if not InputValidator.validate_username(username):
+                            print(f"❌ Invalid username format: '{username}'")
+                            print("💡 Username must be 3-32 chars, alphanumeric + underscore only")
+                            continue
+                        
+                        # Check if user exists in database
+                        user_info = self.db.get_user_info(username)
+                        
+                        if not user_info:
+                            print(f"❌ User '{username}' not found.")
+                            print(f"💡 User must complete 'setup' first to be registered.")
+                            print(f"💡 Run 'all_users' to see all registered users.")
+                        else:
+                            # Check if user is banned
+                            if self.db.is_user_banned(username):
+                                print(f"❌ User '{username}' is banned.")
+                                print(f"💡 Unban the user first with 'unban {username}'")
+                                continue
+                            
+                            # Generate new pairing code for the user
+                            ip = user_info['ip']
+                            fingerprint = user_info['fingerprint']
+                            
+                            code = self.db.create_pairing_request(
+                                username, ip, fingerprint, "Admin code generation"
+                            )
+                            
+                            print(f"\n" + "=" * 60)
+                            print(f"🔑 LOGIN CODE GENERATED")
+                            print(f"=" * 60)
+                            print(f"   👤 User: {username}")
+                            print(f"   🔑 Code: \033[1;33m{code}\033[0m")
+                            print(f"   📍 IP: {ip}")
+                            print(f"   🔏 Fingerprint: {fingerprint[:16]}...")
+                            print(f"   ⏰  Expires in: {self.config['security']['code_expiry']} seconds")
+                            print(f"=" * 60)
+                            print(f"💡 Share this code with the user")
+                            print(f"💡 The code is one-time use only")
+                            print(f"💡 The user's device fingerprint must match")
+                            print("=" * 60 + "\n")
+                            
+                            logging.info(f"Login code generated for user '{username}': {code}")
+                    else:
+                        print("❌ Usage: code <username>")
+                        print("💡 Example: code sleep")
                 
                 elif cmd.lower().startswith('ban '):
                     parts = cmd.split(' ', 2)
@@ -2514,12 +2589,27 @@ Commands:
                     else:
                         print("User not found.")
                 
-                elif cmd.lower() == 'list':
-                    print("\n📁 Shared Files:", os.listdir(self.shared_folder))
+                elif cmd.lower() == 'files':
+                    files = os.listdir(self.shared_folder)
+                    if not files:
+                        print("\n📭 No files in shared folder")
+                    else:
+                        print(f"\n📁 Shared Files ({len(files)}):")
+                        for f in files:
+                            path = os.path.join(self.shared_folder, f)
+                            if os.path.isfile(path):
+                                size = os.path.getsize(path)
+                                print(f"  📄 {f} ({FileTransferUtils.format_size(size)})")
                 
                 elif cmd.lower() == 'quit':
                     os._exit(0)
+                
+                elif cmd.strip():
+                    print(f"❌ Unknown command: '{cmd}'")
+                    print("💡 Type 'help' for available commands")
             
+            except KeyboardInterrupt:
+                print("\n\n🛑 Use 'quit' to exit the server")
             except Exception as e:
                 print(f"❌ Error: {e}")
 
