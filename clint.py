@@ -190,16 +190,25 @@ class FileValidator:
     
     @staticmethod
     def is_safe_file(file_path: str) -> bool:
-        """Check if file is safe to read (TOCTOU protection)."""
+        """Check if file is safe to read (simplified version)."""
         try:
-            if os.path.islink(file_path):
+            # Must exist and be a regular file
+            if not os.path.exists(file_path):
                 return False
             if not os.path.isfile(file_path):
                 return False
-            dangerous_paths = ['/dev/', '/proc/', '/sys/', '/etc/']
-            for dangerous in dangerous_paths:
-                if file_path.startswith(dangerous):
+            
+            # Reject symlinks (security)
+            if os.path.islink(file_path):
+                return False
+            
+            # Reject special system files (only exact paths, not subpaths)
+            abs_path = os.path.abspath(file_path)
+            dangerous_exact = ['/dev/null', '/dev/zero', '/proc/self', '/sys/kernel']
+            for dangerous in dangerous_exact:
+                if abs_path == dangerous or abs_path.startswith(dangerous + '/'):
                     return False
+            
             return True
         except Exception:
             return False
@@ -1058,77 +1067,130 @@ class SecureClient:
             return None
     
     def send_file(self, file_path: str, to_user: str = "server") -> bool:
-        """Upload file with TOCTOU protection and resource leak prevention."""
+        """Upload file with proper resource management (FIXED)."""
         file_handle = None
+        
         try:
-            # Open file first (TOCTOU protection)
-            file_handle = open(file_path, 'rb')
-            
-            # Check if it's safe (not symlink, not special file)
-            if not FileValidator.is_safe_file(file_path):
-                print(f"❌ Unsafe file: {file_path}")
+            # Step 1: Validate file exists and is readable
+            if not os.path.exists(file_path):
+                print(f"❌ File not found: {file_path}")
                 return False
             
+            if not os.path.isfile(file_path):
+                print(f"❌ Not a regular file: {file_path}")
+                return False
+            
+            # Step 2: Open file ONCE and keep it open
+            try:
+                file_handle = open(file_path, 'rb')
+            except PermissionError:
+                print(f"❌ Permission denied: {file_path}")
+                return False
+            except Exception as e:
+                print(f"❌ Cannot open file: {e}")
+                return False
+            
+            # Step 3: Get file info
             file_name = os.path.basename(file_path)
             file_size = os.path.getsize(file_path)
-            file_sha256 = FileTransferUtils.calculate_sha256(file_path)
+            
+            if file_size == 0:
+                print(f"❌ File is empty: {file_name}")
+                return False
+            
+            # Step 4: Calculate SHA256 from the OPENED file handle (NOT opening again!)
+            print(f"🔐 Calculating SHA256 for {file_name}...")
+            sha256_hash = hashlib.sha256()
+            file_handle.seek(0)
+            while True:
+                chunk = file_handle.read(8192)
+                if not chunk:
+                    break
+                sha256_hash.update(chunk)
+            file_sha256 = sha256_hash.hexdigest()
+            
+            # Reset file pointer to beginning for sending
+            file_handle.seek(0)
             
             print(f"\n📤 Sending: {file_name} ({FileTransferUtils.format_size(file_size)})")
+            print(f"   🔏 SHA256: {file_sha256[:16]}...")
             
-            JsonProtocol.send_message(self.socket, {
-                "type": "UPLOAD", "filename": file_name,
-                "size": file_size, "sha256": file_sha256
-            })
+            # Step 5: Send metadata to server
+            try:
+                JsonProtocol.send_message(self.socket, {
+                    "type": "UPLOAD", 
+                    "filename": file_name,
+                    "size": file_size, 
+                    "sha256": file_sha256
+                })
+            except Exception as e:
+                print(f"\n❌ Failed to send metadata: {e}")
+                return False
             
+            # Step 6: Send file data
             transfer_timeout = CONFIG["client"]["transfer_timeout"]
             sent_size = 0
             self.socket.settimeout(transfer_timeout)
             
-            while sent_size < file_size:
+            try:
+                while sent_size < file_size:
+                    try:
+                        chunk = file_handle.read(4096)
+                        if not chunk:
+                            break
+                        self.socket.send(chunk)
+                        sent_size += len(chunk)
+                        FileTransferUtils.show_progress(sent_size, file_size, "Sending")
+                    except socket.timeout:
+                        print(f"\n⚠️  Transfer timeout after sending {sent_size} bytes")
+                        return False
+                    except Exception as e:
+                        print(f"\n❌ Network error during transfer: {e}")
+                        return False
+                
+                self.socket.settimeout(None)
+                
+                # Step 7: Wait for server confirmation
                 try:
-                    chunk = file_handle.read(4096)
-                    if not chunk:
-                        break
-                    self.socket.send(chunk)
-                    sent_size += len(chunk)
-                    FileTransferUtils.show_progress(sent_size, file_size, "Sending")
-                except socket.timeout:
-                    print(f"\n⚠️  Transfer timeout")
+                    response = JsonProtocol.recv_message(self.socket)
+                except Exception as e:
+                    print(f"\n❌ Failed to receive server response: {e}")
+                    return False
+                
+                if not response:
+                    print(f"\n❌ No response from server")
+                    return False
+                
+                if response.get('type') == 'FILE_OK':
+                    print(f"\n✅ File sent successfully!")
+                    # Record in sent history
+                    self.sent_history.add_entry(file_name, to_user, file_size)
+                    return True
+                elif response.get('type') == 'FILE_CORRUPTED':
+                    print(f"\n❌ Server detected file corruption (SHA256 mismatch)")
+                    print(f"   Expected: {file_sha256}")
+                    return False
+                else:
+                    error_msg = response.get('message', 'Unknown error')
+                    print(f"\n❌ Server rejected file: {error_msg}")
                     return False
             
-            self.socket.settimeout(None)
-            
-            response = JsonProtocol.recv_message(self.socket)
-            if response and response.get('type') == 'FILE_OK':
-                print(f"\n✅ File sent successfully!")
-                # Record in sent history
-                self.sent_history.add_entry(file_name, to_user, file_size)
-                return True
-            else:
-                print(f"\n⚠️ Transfer failed!")
-                return False
+            finally:
+                self.socket.settimeout(None)
         
-        except FileNotFoundError:
-            print(f"❌ File not found: {file_path}")
-            return False
-        except PermissionError:
-            print(f"❌ Permission denied: {file_path}")
-            return False
         except Exception as e:
-            logging.error(f"Send file error: {e}", exc_info=True)
-            print(f"\n❌ Error sending file")
+            print(f"\n❌ Unexpected error: {e}")
+            import traceback
+            traceback.print_exc()
             return False
+        
         finally:
+            # ALWAYS close the file handle
             if file_handle:
                 try:
                     file_handle.close()
                 except Exception:
                     pass
-            try:
-                if self.socket:
-                    self.socket.settimeout(None)
-            except Exception:
-                pass
     
     def download_file(self, file_name: str, resume: bool = True, 
                       target_dir: str = None) -> bool:
@@ -1657,15 +1719,12 @@ class JulianBrowser:
         stdscr.attroff(curses.color_pair(6))
         
         # Layout: 2 columns, 3 sections
-        # Left column: Local files (top) + Sent History (bottom)
-        # Right column: Server files (full height)
-        
         left_w = w // 2 - 1
         right_w = w - left_w - 2
         right_x = left_w + 2
         
         # === LEFT PANEL: Local Files ===
-        local_height = h - 10  # Reserve space for sent history and status
+        local_height = h - 10
         
         # Title
         title = f" 📁 JulianFiles ({len(self.local_files)}) "

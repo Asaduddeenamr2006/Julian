@@ -17,13 +17,6 @@ Features:
 - TUI Admin Dashboard (curses-based)
 - Zero external dependencies
 
-Design Patterns:
-- Singleton: DatabaseManager
-- Observer: EventBus
-- Command: Protocol commands
-- Factory: CommandFactory
-- Strategy: Connection states
-
 Author: Julian Project
 License: MIT
 Version: 4.4.0
@@ -1746,8 +1739,6 @@ class ServiceDiscovery:
 # ============================================================================
 
 class SystemMonitor:
-    """Monitor system resources using only Python standard library."""
-    
     def __init__(self, history_size=60):
         self.history_size = history_size
         self.cpu_history = deque(maxlen=history_size)
@@ -1931,8 +1922,8 @@ class SystemMonitor:
         
         lines.append(f"{C}║{N}                                                                      {C}║{N}")
         lines.append(f"{C}║{W}  🔗 Connections: {G}{self.active_connections}{N}   "
-                      f"📤 Total Sent: {G}{self.format_size(self.total_bytes_sent)}{N}   "
-                      f"📥 Recv: {B}{self.format_size(self.total_bytes_received)}{N}  {C}║{N}")
+                      f"📤 Total Sent: {G}{FileTransferUtils.format_size(self.total_bytes_sent)}{N}   "
+                      f"📥 Recv: {B}{FileTransferUtils.format_size(self.total_bytes_received)}{N}  {C}║{N}")
         lines.append(f"{C}║{W}  ⏱️  Uptime: {G}{FileTransferUtils.format_uptime(server_uptime)}{N}   "
                       f"🔄 Refresh: {G}2s{N}   "
                       f"📊 History: {G}{len(self.cpu_history)}/{self.history_size}{N} pts{N}          {C}║{N}")
@@ -2661,9 +2652,56 @@ class SecureServer:
             datefmt='%Y-%m-%d %H:%M:%S',
             level=getattr(logging, self.config["logging"]["level"])
         )
+        
+        # 🔴 FIX: Register event handlers (this was missing!)
+        self._setup_event_handlers()
+        
         self.discovery = None
         if self.config["discovery"]["enabled"]:
             self.discovery = ServiceDiscovery(self.port, self.ssl_enabled)
+    
+    # 🔴 FIX: Add the missing event handlers setup
+    def _setup_event_handlers(self) -> None:
+        """Register event handlers for the EventBus."""
+        self.event_bus.subscribe('user_connected', self._on_user_connected)
+        self.event_bus.subscribe('user_disconnected', self._on_user_disconnected)
+        self.event_bus.subscribe('file_uploaded', self._on_file_uploaded)
+        self.event_bus.subscribe('file_downloaded', self._on_file_downloaded)
+        self.event_bus.subscribe('file_deleted', self._on_file_deleted)
+        self.event_bus.subscribe('pairing_requested', self._on_pairing_requested)
+        self.event_bus.subscribe('security_event', self._on_security_event)
+    
+    # 🔴 FIX: Add the missing event handler methods
+    def _on_user_connected(self, data: dict) -> None:
+        logging.info(f"User connected: {data.get('username')} from {data.get('ip')}")
+    
+    def _on_user_disconnected(self, data: dict) -> None:
+        logging.info(f"User disconnected: {data.get('username')}")
+    
+    def _on_file_uploaded(self, data: dict) -> None:
+        resumed = " (resumed)" if data.get('resumed') else ""
+        logging.info(f"File uploaded{resumed}: {data.get('filename')} by {data.get('username')}")
+    
+    def _on_file_downloaded(self, data: dict) -> None:
+        resumed = " (resumed)" if data.get('resumed') else ""
+        logging.info(f"File downloaded{resumed}: {data.get('filename')} by {data.get('username')}")
+    
+    def _on_file_deleted(self, data: dict) -> None:
+        logging.info(f"File deleted: {data.get('filename')} by {data.get('username')}")
+    
+    def _on_pairing_requested(self, data: dict) -> None:
+        """🔴 THIS IS THE KEY FIX - prints the pairing code to admin console!"""
+        print("\n" + "=" * 60)
+        print(f"🔑 NEW PAIRING REQUEST")
+        print(f"   Username: {data.get('username')}")
+        print(f"   Device: {data.get('device_info')}")
+        print(f"   IP: {data.get('ip')}")
+        print(f"   Code: \033[1;33m{data.get('code')}\033[0m")
+        print(f"   ⏰  Expires in {self.config['security']['code_expiry']} seconds")
+        print("=" * 60 + "\n")
+    
+    def _on_security_event(self, data: dict) -> None:
+        print(f"\n🛡️ SECURITY: {data.get('type')} from {data.get('ip')} - {data.get('details')}")
     
     def start(self, dashboard_mode=False) -> None:
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -2724,6 +2762,9 @@ class SecureServer:
     
     def _silent_close(self, client, ip, mac, attempt_type, details):
         self.db.log_security_event(ip, mac, attempt_type, details)
+        self.event_bus.publish('security_event', {
+            'type': attempt_type, 'ip': ip, 'details': details
+        })
         try:
             client.close()
         except Exception:
@@ -2782,10 +2823,13 @@ class SecureServer:
             self._silent_close(client, addr[0], mac_address, "BANNED_USER", f"Banned: {username}")
             return
         code = self.db.create_pairing_request(username, addr[0], device_fingerprint, device_info)
+        
+        # 🔴 This publishes the event which triggers _on_pairing_requested
         self.event_bus.publish('pairing_requested', {
             'username': username, 'device_info': device_info,
             'ip': addr[0], 'code': code
         })
+        
         JsonProtocol.send_message(client, {"type": "PAIR_CODE", "code": code})
         code_expiry = self.config["security"]["code_expiry"]
         client.settimeout(code_expiry)
